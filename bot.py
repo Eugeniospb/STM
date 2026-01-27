@@ -1,0 +1,461 @@
+"""
+Фемида v2.1 — Юридический ассистент ООО "СТМ"
++ Память 30 сообщений
++ Реакция на reply в группе
+"""
+
+import os
+import io
+import re
+import base64
+import logging
+from datetime import datetime
+from pathlib import Path
+from collections import defaultdict
+
+from telegram import Update, Chat, Message
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.constants import ParseMode, ChatAction
+
+import anthropic
+from docx import Document as DocxDocument
+from docx.shared import Pt, Cm, Inches, RGBColor
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+
+MODEL_CHEAP = "claude-3-haiku-20240307"
+MODEL_EXPENSIVE = "claude-sonnet-4-20250514"
+MAX_TOKENS_CHEAP = 2048
+MAX_TOKENS_EXPENSIVE = 4096
+
+DIRECTOR_USERNAME = "eugenio_spb"
+DIRECTOR_ID = 1676748258
+GROUP_ID = int(os.getenv("GROUP_ID", "-1003639268911"))
+TRIGGERS = ["фемида,", "феми,", "фемида ", "феми "]
+
+MEMORY_LIMIT = 30  # Количество сообщений в памяти
+
+ASSETS_DIR = Path(__file__).parent / "assets"
+LOGO_PATH = ASSETS_DIR / "logo.png"
+
+# Память диалогов: {chat_id: [{"role": "user/assistant", "content": "..."}]}
+conversation_history = defaultdict(list)
+
+COMPANY = {
+    "full_name": "Общество с ограниченной ответственностью «СТМ»",
+    "short_name": "ООО «СТМ»",
+    "inn": "7813568956", "kpp": "781401001", "ogrn": "1137847312866",
+    "address": "197375, Санкт-Петербург, ул. Маршала Новикова д.42, Литер А, Помещение ПИБ №1-Н-113",
+    "bank": "АО «ТИНЬКОФФ БАНК»", "bik": "044525974",
+    "rs": "40702810810000134609", "ks": "30101810145250000974",
+    "director": "Тихонов Евгений Викторович", "director_short": "Тихонов Е.В.",
+    "director_position": "Генеральный директор",
+    "phone": "+7 812 603 78 71", "email": "stm.laser@gmail.com",
+}
+
+IP_TIKHONOV = {
+    "full_name": "ИП Тихонов Александр Викторович", "short_name": "ИП Тихонов А.В.",
+    "inn": "781428127765", "ogrnip": "319784700268498",
+    "address": "197375, Санкт-Петербург, ул. Репищева д.17, корп.1, кв.28",
+    "bank": "АО «ТИНЬКОФФ БАНК»", "bik": "044525974",
+    "rs": "40802810400001208048", "ks": "30101810145250000974",
+}
+
+client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+EXPENSIVE_PATTERNS = [
+    r"(составь|напиши|подготовь|создай|сделай).*(договор|письмо|претензи|приказ|иск|заявлени|акт)",
+    r"(проанализируй|проверь|изучи|оцени).*(договор|документ|контракт)",
+    r"(разработай|предложи).*(стратеги|план|схем)",
+]
+
+def is_expensive_request(text: str, has_file: bool = False) -> bool:
+    if has_file:
+        return True
+    text_lower = text.lower()
+    for pattern in EXPENSIVE_PATTERNS:
+        if re.search(pattern, text_lower):
+            return True
+    if len(text) > 500:
+        return True
+    return False
+
+def get_model_for_request(text: str, has_file: bool = False) -> tuple:
+    if is_expensive_request(text, has_file):
+        return MODEL_EXPENSIVE, MAX_TOKENS_EXPENSIVE
+    return MODEL_CHEAP, MAX_TOKENS_CHEAP
+
+def is_director(user_id: int, username: str = None) -> bool:
+    if user_id == DIRECTOR_ID:
+        return True
+    if username and username.lower() == DIRECTOR_USERNAME.lower():
+        return True
+    return False
+
+def has_trigger(text: str) -> tuple:
+    text_lower = text.lower()
+    for trigger in TRIGGERS:
+        if text_lower.startswith(trigger):
+            return True, text[len(trigger):].strip()
+    return False, text
+
+async def download_file(bot, file_id: str) -> bytes:
+    file = await bot.get_file(file_id)
+    buffer = io.BytesIO()
+    await file.download_to_memory(buffer)
+    buffer.seek(0)
+    return buffer.read()
+
+async def process_document(bot, document) -> tuple:
+    mime_type = document.mime_type or "application/octet-stream"
+    file_data = await download_file(bot, document.file_id)
+    base64_data = base64.standard_b64encode(file_data).decode("utf-8")
+    if mime_type == "application/pdf":
+        return base64_data, "application/pdf"
+    elif mime_type.startswith("image/"):
+        return base64_data, mime_type
+    else:
+        try:
+            return file_data.decode("utf-8"), "text"
+        except:
+            return base64_data, mime_type
+
+async def process_photo(bot, photo) -> tuple:
+    file_data = await download_file(bot, photo.file_id)
+    base64_data = base64.standard_b64encode(file_data).decode("utf-8")
+    return base64_data, "image/jpeg"
+
+def get_current_date_ru() -> str:
+    months = {1:"января",2:"февраля",3:"марта",4:"апреля",5:"мая",6:"июня",7:"июля",8:"августа",9:"сентября",10:"октября",11:"ноября",12:"декабря"}
+    now = datetime.now()
+    return f"{now.day} {months[now.month]} {now.year} г."
+
+def build_system_prompt() -> str:
+    return f"""Ты — юридический ассистент "Фемида" компании {COMPANY['short_name']}.
+
+ЗАДАЧИ: Составление документов (договоры, письма, претензии), анализ договоров, консультации по ГК/ТК/НК РФ.
+
+РЕКВИЗИТЫ ООО «СТМ»:
+ИНН: {COMPANY['inn']}, КПП: {COMPANY['kpp']}, ОГРН: {COMPANY['ogrn']}
+Адрес: {COMPANY['address']}
+Р/с: {COMPANY['rs']}, Банк: {COMPANY['bank']}, БИК: {COMPANY['bik']}
+Директор: {COMPANY['director']}
+
+РЕКВИЗИТЫ ИП Тихонов А.В.:
+ИНН: {IP_TIKHONOV['inn']}, ОГРНИП: {IP_TIKHONOV['ogrnip']}
+Р/с: {IP_TIKHONOV['rs']}
+
+СЕГОДНЯ: {get_current_date_ru()}
+
+Обращайся на "вы" или "Евгений". По умолчанию документы от ООО СТМ. Если просят "от ИП" — используй ИП Тихонов."""
+
+def add_to_memory(chat_id: int, role: str, content: str):
+    """Добавляет сообщение в память"""
+    conversation_history[chat_id].append({"role": role, "content": content})
+    # Обрезаем до лимита
+    if len(conversation_history[chat_id]) > MEMORY_LIMIT:
+        conversation_history[chat_id] = conversation_history[chat_id][-MEMORY_LIMIT:]
+
+def get_memory(chat_id: int) -> list:
+    """Возвращает историю диалога"""
+    return conversation_history[chat_id].copy()
+
+def clear_memory(chat_id: int):
+    """Очищает память для чата"""
+    conversation_history[chat_id] = []
+
+async def generate_response(chat_id: int, text: str, file_data: tuple = None) -> tuple:
+    has_file = file_data is not None
+    model, max_tokens = get_model_for_request(text, has_file)
+    logger.info(f"Запрос → модель: {model}, файл: {has_file}")
+    
+    try:
+        # Формируем контент текущего сообщения
+        if file_data and file_data[0]:
+            base64_data, media_type = file_data
+            if media_type == "text":
+                current_content = [{"type": "text", "text": f"Файл:\n{base64_data}\n\nЗапрос: {text}"}]
+            elif media_type == "application/pdf":
+                current_content = [
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": base64_data}},
+                    {"type": "text", "text": text or "Проанализируй этот документ."}
+                ]
+            else:
+                current_content = [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": base64_data}},
+                    {"type": "text", "text": text or "Что на этом документе?"}
+                ]
+        else:
+            current_content = text
+        
+        # Собираем историю + текущее сообщение
+        messages = get_memory(chat_id)
+        messages.append({"role": "user", "content": current_content})
+        
+        message = client.messages.create(
+            model=model, 
+            max_tokens=max_tokens, 
+            system=build_system_prompt(), 
+            messages=messages
+        )
+        response_text = message.content[0].text
+        
+        # Сохраняем в память (только текст, без файлов)
+        add_to_memory(chat_id, "user", text)
+        add_to_memory(chat_id, "assistant", response_text)
+        
+        logger.info(f"Токены: in={message.usage.input_tokens}, out={message.usage.output_tokens}, память: {len(get_memory(chat_id))} сообщений")
+        return response_text, model
+    except Exception as e:
+        logger.error(f"Ошибка Claude: {e}")
+        return f"⚠️ Ошибка: {e}", model
+
+def create_docx_on_letterhead(content: str) -> io.BytesIO:
+    doc = DocxDocument()
+    style = doc.styles['Normal']
+    style.font.name = 'Times New Roman'
+    style.font.size = Pt(12)
+    
+    for section in doc.sections:
+        section.top_margin = Cm(2)
+        section.bottom_margin = Cm(2)
+        section.left_margin = Cm(3)
+        section.right_margin = Cm(1.5)
+    
+    header = doc.sections[0].header
+    header_table = header.add_table(rows=1, cols=2, width=Inches(6.5))
+    header_table.columns[0].width = Inches(1.2)
+    header_table.columns[1].width = Inches(5.3)
+    
+    logo_cell = header_table.cell(0, 0)
+    if LOGO_PATH.exists():
+        logo_para = logo_cell.paragraphs[0]
+        logo_run = logo_para.add_run()
+        logo_run.add_picture(str(LOGO_PATH), width=Inches(1))
+    
+    text_cell = header_table.cell(0, 1)
+    name_para = text_cell.paragraphs[0]
+    name_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run1 = name_para.add_run("ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ")
+    run1.font.bold = True
+    run1.font.size = Pt(11)
+    
+    p2 = text_cell.add_paragraph()
+    p2.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run2 = p2.add_run("«СТМ»")
+    run2.font.bold = True
+    run2.font.size = Pt(14)
+    run2.font.color.rgb = RGBColor(0, 112, 192)
+    
+    p3 = text_cell.add_paragraph()
+    p3.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run3 = p3.add_run(f"{COMPANY['address']}\nИНН {COMPANY['inn']} · КПП {COMPANY['kpp']} · ОГРН {COMPANY['ogrn']}")
+    run3.font.size = Pt(8)
+    
+    line = header.add_paragraph()
+    line.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    lr = line.add_run("─" * 85)
+    lr.font.size = Pt(8)
+    lr.font.color.rgb = RGBColor(0, 112, 192)
+    
+    doc.add_paragraph()
+    for para_text in content.split('\n'):
+        if para_text.strip():
+            p = doc.add_paragraph()
+            stripped = para_text.strip()
+            if stripped.isupper() or any(stripped.startswith(x) for x in ['ДОГОВОР','ПРИКАЗ','ПРЕТЕНЗИЯ','АКТ','ПИСЬМО']):
+                p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                run = p.add_run(stripped)
+                run.bold = True
+            else:
+                p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                p.paragraph_format.first_line_indent = Cm(1.25)
+                run = p.add_run(stripped)
+            run.font.name = 'Times New Roman'
+            run.font.size = Pt(12)
+    
+    doc.add_paragraph()
+    doc.add_paragraph()
+    sig = doc.add_paragraph()
+    sig.add_run(f"{COMPANY['director_position']}                    _____________    {COMPANY['director_short']}")
+    
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_director(user.id, user.username):
+        await update.message.reply_text("⚖️ Фемида доступна только руководству ООО «СТМ».")
+        return
+    await update.message.reply_text(
+        "⚖️ *Фемида* — юридический ассистент ООО «СТМ»\n\n"
+        "• Составление договоров, писем, претензий\n"
+        "• Анализ документов (PDF, фото)\n"
+        "• Юридические консультации\n\n"
+        f"_Память: {MEMORY_LIMIT} сообщений_\n"
+        "_В группе: Фемида, ... или ответ на моё сообщение_",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Очистка памяти"""
+    chat_id = update.effective_chat.id
+    clear_memory(chat_id)
+    await update.message.reply_text("🧹 Память очищена. Начинаем с чистого листа.")
+
+async def cmd_requisites(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"📋 *Реквизиты ООО «СТМ»*\n\n"
+        f"ИНН: `{COMPANY['inn']}`\nКПП: `{COMPANY['kpp']}`\nОГРН: `{COMPANY['ogrn']}`\n"
+        f"Адрес: {COMPANY['address']}\n\n"
+        f"Банк: {COMPANY['bank']}\nР/с: `{COMPANY['rs']}`\nК/с: `{COMPANY['ks']}`\nБИК: `{COMPANY['bik']}`\n\n"
+        f"Директор: {COMPANY['director']}",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if not message:
+        return
+    
+    user = update.effective_user
+    chat = update.effective_chat
+    bot_id = context.bot.id
+    
+    text = message.text or message.caption or ""
+    text = text.strip()
+    
+    file_data = None
+    if message.document:
+        file_data = await process_document(context.bot, message.document)
+    elif message.photo:
+        photo = message.photo[-1]
+        file_data = await process_photo(context.bot, photo)
+    
+    if file_data and not text:
+        text = "Проанализируй этот документ. Что это и о чём он?"
+    
+    if not text and not file_data:
+        return
+    
+    # ========== ЛИЧНЫЙ ЧАТ ==========
+    if chat.type == Chat.PRIVATE:
+        if not is_director(user.id, user.username):
+            await message.reply_text("⚖️ Фемида доступна только руководству ООО «СТМ».")
+            return
+        await process_request(message, text, file_data, context)
+        return
+    
+    # ========== ГРУППОВОЙ ЧАТ ==========
+    if chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        if chat.id != GROUP_ID:
+            return
+        
+        if not is_director(user.id, user.username):
+            return
+        
+        # Проверяем: триггер ИЛИ reply на сообщение бота
+        has_trig, clean_text = has_trigger(text)
+        
+        is_reply_to_bot = False
+        if message.reply_to_message and message.reply_to_message.from_user:
+            if message.reply_to_message.from_user.id == bot_id:
+                is_reply_to_bot = True
+        
+        if has_trig:
+            await process_request(message, clean_text, file_data, context)
+        elif is_reply_to_bot:
+            await process_request(message, text, file_data, context)
+        # Иначе молча игнорируем
+
+async def process_request(message: Message, text: str, file_data: tuple, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = message.chat_id
+    
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    
+    text_lower = text.lower()
+    if "реквизиты" in text_lower and not file_data:
+        if "ип" in text_lower or "тихонов а" in text_lower:
+            await message.reply_text(
+                f"📋 *Реквизиты ИП Тихонов А.В.*\n\n"
+                f"ИНН: `{IP_TIKHONOV['inn']}`\nОГРНИП: `{IP_TIKHONOV['ogrnip']}`\n"
+                f"Адрес: {IP_TIKHONOV['address']}\n\n"
+                f"Банк: {IP_TIKHONOV['bank']}\nР/с: `{IP_TIKHONOV['rs']}`\nК/с: `{IP_TIKHONOV['ks']}`\nБИК: `{IP_TIKHONOV['bik']}`",
+                parse_mode=ParseMode.MARKDOWN
+            )
+            return
+        elif "стм" in text_lower or "ооо" in text_lower or text_lower.strip() == "реквизиты":
+            await cmd_requisites(Update(0, message=message), context)
+            return
+    
+    response, model_used = await generate_response(chat_id, text, file_data)
+    
+    need_docx = any(word in text_lower for word in ["docx", "файл", "документ", "word", "ворд", "бланк"])
+    need_docx = need_docx or (
+        any(word in text_lower for word in ["составь", "напиши", "подготовь", "создай"]) and 
+        any(word in text_lower for word in ["договор", "письмо", "претензи", "приказ", "иск", "акт", "заявлени"])
+    )
+    
+    if len(response) > 4000:
+        if need_docx:
+            docx_buffer = create_docx_on_letterhead(response)
+            await message.reply_document(
+                document=docx_buffer,
+                filename=f"STM_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                caption="📄 Документ на фирменном бланке ООО «СТМ»"
+            )
+        else:
+            for i in range(0, len(response), 4000):
+                await message.reply_text(response[i:i+4000])
+    else:
+        try:
+            await message.reply_text(response, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            await message.reply_text(response)
+        
+        if need_docx and len(response) > 200:
+            docx_buffer = create_docx_on_letterhead(response)
+            await message.reply_document(
+                document=docx_buffer,
+                filename=f"STM_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                caption="📄 Документ на фирменном бланке"
+            )
+    
+    model_label = "💰 Sonnet" if model_used == MODEL_EXPENSIVE else "💚 Haiku"
+    logger.info(f"Ответ: {model_label}, {len(response)} символов")
+
+def main():
+    if not TELEGRAM_TOKEN:
+        raise ValueError("TELEGRAM_TOKEN не установлен!")
+    if not ANTHROPIC_API_KEY:
+        raise ValueError("ANTHROPIC_API_KEY не установлен!")
+    
+    ASSETS_DIR.mkdir(exist_ok=True)
+    
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("clear", cmd_clear))
+    app.add_handler(CommandHandler("requisites", cmd_requisites))
+    app.add_handler(MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.ALL, handle_message))
+    
+    logger.info("🚀 Фемида v2.1 запущена!")
+    logger.info(f"   Директор: @{DIRECTOR_USERNAME} (ID: {DIRECTOR_ID})")
+    logger.info(f"   Группа: {GROUP_ID}")
+    logger.info(f"   Память: {MEMORY_LIMIT} сообщений")
+    logger.info(f"   Модели: {MODEL_CHEAP} / {MODEL_EXPENSIVE}")
+    logger.info(f"   Логотип: {'✓' if LOGO_PATH.exists() else '✗'}")
+    
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
