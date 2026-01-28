@@ -5,7 +5,6 @@
 """
 
 import os
-import asyncio
 import io
 import re
 import base64
@@ -55,12 +54,6 @@ ASSETS_DIR = Path(__file__).parent / "assets"
 LOGO_PATH = ASSETS_DIR / "logo.png"
 
 conversation_history = defaultdict(list)
-# Кеш для media_group (несколько файлов в одном сообщении)
-media_group_cache = {}
-media_group_timers = {}
-# Кеш последней media_group для reply (по chat_id, храним 1 час)
-media_group_files_cache = {}  # {chat_id: {"files": [...], "time": datetime}}
-
 
 COMPANY = {
     "full_name": "Общество с ограниченной ответственностью «СТМ»",
@@ -331,59 +324,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     bot_id = context.bot.id
     
-    # === ОБРАБОТКА MEDIA_GROUP (несколько файлов) ===
-    if message.media_group_id:
-        mg_id = message.media_group_id
-        
-        # Инициализируем кеш
-        if mg_id not in media_group_cache:
-            media_group_cache[mg_id] = {"files": [], "text": "", "message": message, "user": user, "chat": chat}
-        
-        # Собираем файл
-        if message.document:
-            fd = await process_document(context.bot, message.document)
-            if fd:
-                media_group_cache[mg_id]["files"].append(fd)
-        elif message.photo:
-            fd = await process_photo(context.bot, message.photo[-1])
-            if fd:
-                media_group_cache[mg_id]["files"].append(fd)
-        
-        # Сохраняем caption
-        if message.caption:
-            media_group_cache[mg_id]["text"] = message.caption.strip()
-        
-        # Отменяем предыдущий таймер
-        if mg_id in media_group_timers:
-            media_group_timers[mg_id].cancel()
-        
-        # Таймер на обработку
-        async def process_mg():
-            await asyncio.sleep(1.5)
-            if mg_id in media_group_cache:
-                data = media_group_cache.pop(mg_id)
-                media_group_timers.pop(mg_id, None)
-                files_list = data["files"]
-                txt = data["text"] or f"Проанализируй эти {len(files_list)} документов."
-                msg = data["message"]
-                usr = data["user"]
-                cht = data["chat"]
-                
-                if cht.type in [Chat.GROUP, Chat.SUPERGROUP]:
-                    if not is_director(usr.id, usr.username):
-                        return
-                    has_trig, clean_txt = has_trigger(txt)
-                    if has_trig:
-                        await process_request_multi(msg, clean_txt, files_list, context)
-                elif cht.type == Chat.PRIVATE:
-                    if is_director(usr.id, usr.username):
-                        await process_request_multi(msg, txt, files_list, context)
-        
-        task = asyncio.create_task(process_mg())
-        media_group_timers[mg_id] = task
-        return
-    
-    # === ОБЫЧНАЯ ОБРАБОТКА (один файл) ===
     text = message.text or message.caption or ""
     text = text.strip()
     
@@ -414,22 +354,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_id
         
 
-        # Берём файлы из reply если в текущем сообщении нет
+        # Берём файл из reply если в текущем сообщении нет
         if not file_data and message.reply_to_message:
             reply_msg = message.reply_to_message
-            reply_id = reply_msg.message_id
-            
-            # Проверяем кеш media_group (по chat_id)
-            if chat.id in media_group_files_cache:
-                cached = media_group_files_cache[chat.id]
-                if (datetime.now() - cached["time"]).seconds < 3600:
-                    files_list = cached["files"]
-                    has_trig, clean_text = has_trigger(text)
-                    if has_trig:
-                        await process_request_multi(message, clean_text, files_list, context)
-                        return
-            
-            # Обычная обработка одного файла из reply
             if reply_msg.document:
                 file_data = await process_document(context.bot, reply_msg.document)
             elif reply_msg.photo:
@@ -438,83 +365,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await process_request(message, clean_text, file_data, context)
         elif is_reply_to_bot:
             await process_request(message, text, file_data, context)
-
-
-async def process_request_multi(message: Message, text: str, files_list: list, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка запроса с несколькими файлами"""
-    chat_id = message.chat_id
-    
-    # Сохраняем в кеш для будущих reply (по chat_id)
-    media_group_files_cache[chat_id] = {
-        "files": files_list,
-        "time": datetime.now()
-    }
-    # Чистим старые записи (>1 часа)
-    old_ids = [k for k, v in media_group_files_cache.items() 
-               if (datetime.now() - v["time"]).seconds > 3600]
-    for k in old_ids:
-        media_group_files_cache.pop(k, None)
-    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
-    
-    # Собираем все файлы в один запрос
-    combined_content = []
-    for i, file_data in enumerate(files_list, 1):
-        base64_data, media_type = file_data
-        combined_content.append({
-            "type": "document" if media_type == "application/pdf" else "image",
-            "source": {"type": "base64", "media_type": media_type, "data": base64_data}
-        })
-    
-    # Формируем сообщение для Claude
-    messages_content = combined_content + [{"type": "text", "text": text}]
-    
-    model = MODEL_EXPENSIVE  # Всегда Sonnet для мультифайлов
-    
-    # RAG контекст
-    legal_context = ""
-    if RAG_ENABLED and legal_rag:
-        legal_context = legal_rag.get_context_for_query(text)
-    
-    system = build_system_prompt(text)
-    if legal_context:
-        system += f"\n\nПРАВОВАЯ БАЗА:\n{legal_context}"
-    
-    try:
-        response = client.messages.create(
-            model=model,
-            max_tokens=MAX_TOKENS_EXPENSIVE,
-            system=system,
-            messages=[{"role": "user", "content": messages_content}]
-        )
-        result = response.content[0].text
-        logger.info(f"Мультифайл: {len(files_list)} файлов, токены: in={response.usage.input_tokens}, out={response.usage.output_tokens}")
-    except Exception as e:
-        logger.error(f"Ошибка Claude: {e}")
-        result = f"Ошибка обработки: {e}"
-    
-    # Отправляем ответ
-    text_lower = text.lower()
-    need_docx = any(phrase in text_lower for phrase in ["на бланке", "создай ответ", "создай письмо", "подготовь ответ"])
-    
-    if len(result) > 4000:
-        for i in range(0, len(result), 4000):
-            await message.reply_text(result[i:i+4000])
-    else:
-        try:
-            await message.reply_text(result, parse_mode=ParseMode.MARKDOWN)
-        except:
-            await message.reply_text(result)
-    
-    if need_docx:
-        from companies import find_company
-        company_key, company_data = find_company(text_lower)
-        if company_key:
-            docx_buffer = create_docx_on_letterhead(result)
-            await message.reply_document(
-                document=docx_buffer,
-                filename=f"STM_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
-                caption=f"📄 На бланке {company_data['short_name']}"
-            )
 
 async def process_request(message: Message, text: str, file_data: tuple, context: ContextTypes.DEFAULT_TYPE):
     chat_id = message.chat_id
@@ -535,15 +385,8 @@ async def process_request(message: Message, text: str, file_data: tuple, context
     
     response, model_used = await generate_response(chat_id, text, file_data)
     
-
-    # DOCX только по явному запросу: "создай на бланке ИП/ООО/Трифонова"
-    need_docx = False
-    company_key = None
-    if any(phrase in text_lower for phrase in ["на бланке", "на бланк ", "создай ответ", "создай письмо", "создай претензию", "подготовь ответ", "подготовь письмо"]):
-        from companies import find_company
-        company_key, company_data = find_company(text_lower)
-        if company_key:
-            need_docx = True
+    need_docx = any(w in text_lower for w in ["docx", "файл", "документ", "word", "ворд", "бланк"])
+    need_docx = need_docx or (any(w in text_lower for w in ["составь", "напиши", "подготовь"]) and any(w in text_lower for w in ["договор", "письмо", "претензи", "приказ", "иск", "акт"]))
     
     if len(response) > 4000:
         if need_docx:
