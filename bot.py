@@ -13,6 +13,14 @@ import logging
 from datetime import datetime
 from pathlib import Path
 from collections import defaultdict
+from legal_prompts import (
+    detect_legal_mode, get_system_prompt, safety_check, 
+    needs_escalation, ESCALATION_WARNING, MODE_EMOJI, MODE_NAME_RU
+)
+from legal_prompts import (
+    detect_legal_mode, get_system_prompt, safety_check, 
+    needs_escalation, ESCALATION_WARNING, MODE_EMOJI, MODE_NAME_RU
+)
 
 from telegram import Update, Chat, Message
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -182,7 +190,7 @@ def clear_memory(chat_id: int):
 async def generate_response(chat_id: int, text: str, file_data: tuple = None) -> tuple:
     has_file = file_data is not None
     model, max_tokens = get_model_for_request(text, has_file)
-    logger.info(f"Запрос → модель: {model}, файл: {has_file}")
+    logger.info(f"Запрос → модель: {model}, файл: {has_file}, режим: {legal_mode}")
     
     try:
         if file_data and file_data[0]:
@@ -475,7 +483,7 @@ async def process_request_multi(message: Message, text: str, files_list: list, c
     if RAG_ENABLED and legal_rag:
         legal_context = legal_rag.get_context_for_query(text)
     
-    system = build_system_prompt(text)
+    system, legal_mode, escalation_flag = build_system_prompt(text, has_file)
     if legal_context:
         system += f"\n\nПРАВОВАЯ БАЗА:\n{legal_context}"
     
