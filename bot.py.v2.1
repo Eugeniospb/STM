@@ -47,7 +47,7 @@ MAX_TOKENS_EXPENSIVE = 4096
 DIRECTOR_USERNAME = "eugenio_spb"
 DIRECTOR_ID = 1676748258
 GROUP_ID = int(os.getenv("GROUP_ID", "-1003639268911"))
-TRIGGERS = ["фемида,", "фемида ", "феми,", "феми ", "фем,", "фем "]
+TRIGGERS = ["фемида,", "феми,", "фемида ", "феми "]
 MEMORY_LIMIT = 30
 
 ASSETS_DIR = Path(__file__).parent / "assets"
@@ -347,20 +347,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if chat.type in [Chat.GROUP, Chat.SUPERGROUP]:
+        if chat.id != GROUP_ID:
+            return
         if not is_director(user.id, user.username):
             return
         
         has_trig, clean_text = has_trigger(text)
         is_reply_to_bot = message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_id
         
-
-        # Берём файл из reply если в текущем сообщении нет
-        if not file_data and message.reply_to_message:
-            reply_msg = message.reply_to_message
-            if reply_msg.document:
-                file_data = await process_document(context.bot, reply_msg.document)
-            elif reply_msg.photo:
-                file_data = await process_photo(context.bot, reply_msg.photo[-1])
         if has_trig:
             await process_request(message, clean_text, file_data, context)
         elif is_reply_to_bot:
