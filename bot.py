@@ -27,6 +27,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 from telegram.constants import ParseMode, ChatAction
 
 import anthropic
+import asyncpg
 # RAG для юридической базы
 import sys
 sys.path.insert(0, "/opt/stm-legal-rag")
@@ -55,6 +56,14 @@ MAX_TOKENS_EXPENSIVE = 4096
 
 ALLOWED_USERNAMES = ["eugenio_spb", "aleksey_trifonov77", "nmnew01"]
 ALLOWED_IDS = [1676748258]  # eugenio_spb
+
+HR_DB_CONFIG = {
+    "host": "172.17.0.1",
+    "port": 5432,
+    "user": "hr_bot",
+    "password": "STM2025secure!",
+    "database": "hr_database",
+}
 GROUP_ID = int(os.getenv("GROUP_ID", "-1003639268911"))
 TRIGGERS = ["фемида,", "фемида ", "феми,", "феми ", "фем,", "фем "]
 MEMORY_LIMIT = 30
@@ -63,6 +72,7 @@ ASSETS_DIR = Path(__file__).parent / "assets"
 LOGO_PATH = ASSETS_DIR / "logo.png"
 
 conversation_history = defaultdict(list)
+user_name_cache = {}  # telegram_id -> имя из HR
 # Кеш для media_group (несколько файлов в одном сообщении)
 media_group_cache = {}
 media_group_timers = {}
@@ -160,7 +170,30 @@ def get_current_date_ru() -> str:
     now = datetime.now()
     return f"{now.day} {months[now.month]} {now.year} г."
 
-def build_system_prompt(query: str = None) -> str:
+
+async def get_employee_name(telegram_id: int = None, username: str = None) -> str:
+    """Получает имя сотрудника из HR базы"""
+    try:
+        conn = await asyncpg.connect(**HR_DB_CONFIG)
+        row = None
+        if telegram_id:
+            row = await conn.fetchrow(
+                "SELECT first_name, last_name FROM employees WHERE telegram_id = $1", 
+                telegram_id
+            )
+        if not row and username:
+            row = await conn.fetchrow(
+                "SELECT first_name, last_name FROM employees WHERE LOWER(telegram_username) = LOWER($1)",
+                username.replace("@", "")
+            )
+        await conn.close()
+        if row:
+            return row['first_name']
+    except Exception as e:
+        logger.warning(f"HR lookup failed: {e}")
+    return None
+
+def build_system_prompt(query: str = None, user_name: str = None) -> str:
     base = f"""Ты — юридический ассистент "Фемида" компании {COMPANY['short_name']}.
 
 ЗАДАЧИ: Составление документов, анализ договоров, консультации по ГК/ТК/НК РФ.
@@ -174,7 +207,11 @@ def build_system_prompt(query: str = None) -> str:
 
 СЕГОДНЯ: {get_current_date_ru()}
 
-Обращайся на "вы" или "Евгений". По умолчанию документы от ООО СТМ."""
+"""
+    if user_name:
+        base += f"\nПОЛЬЗОВАТЕЛЬ: {user_name}. Обращайся к нему на вы по имени."
+    else:
+        base += "\nОбращайся к пользователю на вы."
 
     if RAG_ENABLED and legal_rag and query:
         try:
@@ -196,7 +233,7 @@ def get_memory(chat_id: int) -> list:
 def clear_memory(chat_id: int):
     conversation_history[chat_id] = []
 
-async def generate_response(chat_id: int, text: str, file_data: tuple = None) -> tuple:
+async def generate_response(chat_id: int, text: str, file_data: tuple = None, user_name: str = None) -> tuple:
     has_file = file_data is not None
     model, max_tokens = get_model_for_request(text, has_file)
     logger.info(f"Запрос → модель: {model}, файл: {has_file}, режим: определяется")
@@ -222,7 +259,7 @@ async def generate_response(chat_id: int, text: str, file_data: tuple = None) ->
         messages = get_memory(chat_id)
         messages.append({"role": "user", "content": current_content})
         
-        message = client.messages.create(model=model, max_tokens=max_tokens, system=build_system_prompt(text), messages=messages)
+        message = client.messages.create(model=model, max_tokens=max_tokens, system=build_system_prompt(text, user_name), messages=messages)
         response_text = message.content[0].text
         
         add_to_memory(chat_id, "user", text)
@@ -458,8 +495,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def process_request_multi(message: Message, text: str, files_list: list, context: ContextTypes.DEFAULT_TYPE):
     """Обработка запроса с несколькими файлами"""
     chat_id = message.chat_id
-    
-    # Сохраняем в кеш для будущих reply (по chat_id)
+    # Получаем имя из HR или Telegram
+    user = message.from_user
+    user_name = await get_employee_name(user.id, user.username) if user else None
+    if not user_name and user:
+        user_name = user.first_name
+    # Получаем имя из HR или Telegram
     media_group_files_cache[chat_id] = {
         "files": files_list,
         "time": datetime.now()
@@ -491,7 +532,7 @@ async def process_request_multi(message: Message, text: str, files_list: list, c
         legal_context = legal_rag.get_context_for_query(text)
     
     
-    system = build_system_prompt(text)
+    system = build_system_prompt(text, user_name)
     legal_mode = "multi-file"
     escalation_flag = False
     if legal_context:
@@ -536,6 +577,16 @@ async def process_request_multi(message: Message, text: str, files_list: list, c
 
 async def process_request(message: Message, text: str, file_data: tuple, context: ContextTypes.DEFAULT_TYPE):
     chat_id = message.chat_id
+    # Получаем имя из HR или Telegram
+    user = message.from_user
+    user_name = await get_employee_name(user.id, user.username) if user else None
+    if not user_name and user:
+        user_name = user.first_name
+    # Получаем имя из HR или Telegram
+    user = message.from_user
+    user_name = await get_employee_name(user.id, user.username) if user else None
+    if not user_name and user:
+        user_name = user.first_name
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     
     text_lower = text.lower()
@@ -551,7 +602,7 @@ async def process_request(message: Message, text: str, file_data: tuple, context
             await cmd_requisites(Update(0, message=message), context)
             return
     
-    response, model_used = await generate_response(chat_id, text, file_data)
+    response, model_used = await generate_response(chat_id, text, file_data, user_name)
     
 
     # DOCX только по явному запросу: "создай на бланке ИП/ООО/Трифонова"
